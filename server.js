@@ -1,93 +1,358 @@
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const dns = require('dns').promises;
+const net = require('net');
+const { URL } = require('url');
 
-function canonicalize(value) {
-  if (Array.isArray(value)) {
-    return value.map(canonicalize);
-  }
-  if (value !== null && typeof value === 'object') {
-    const out = {};
-    const keys = Object.keys(value).filter((k) => k !== 'trace_id').sort();
-    for (const k of keys) out[k] = canonicalize(value[k]);
-    return out;
-  }
-  if (typeof value === 'string') {
-    return value.trim().replace(/\s+/g, ' ');
-  }
-  return value;
+const SANDBOX_ROOT = '/srv/agent-redteam/sandbox-c071d90674';
+const ALLOWED_HOSTS = new Set(['example.com', 'www.iana.org']);
+const PORT = process.env.PORT || 3000;
+
+// ---------- helpers ----------
+
+function jsonResponse(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(body);
 }
 
-function canonicalStr(step) {
-  return JSON.stringify({ tool: step.tool, args: canonicalize(step.args || {}) });
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > 1_000_000) {
+        reject(new Error('body too large'));
+        req.destroy();
+        return;
+      }
+      data += chunk;
+    });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
 }
 
-function checkRepeat(steps) {
-  if (steps.length < 3) return false;
-  const last = canonicalStr(steps[steps.length - 1]);
-  let count = 1;
-  for (let i = steps.length - 2; i >= 0; i--) {
-    if (canonicalStr(steps[i]) === last) count++;
-    else break;
+// Resolve a path safely against the sandbox root, rejecting traversal.
+// Decodes percent-encoding only as literal filename characters (fs calls
+// never re-decode), and resolves the real path (following symlinks) to
+// make sure it lands inside the sandbox.
+function resolveSandboxPath(userPath) {
+  if (typeof userPath !== 'string' || userPath.length === 0) {
+    return { ok: false, reason: 'invalid path' };
   }
-  return count >= 3;
+  // Reject null bytes outright.
+  if (userPath.includes('\0')) {
+    return { ok: false, reason: 'invalid path' };
+  }
+
+  // Treat the input as a literal relative (or absolute) path segment set.
+  // We do NOT url-decode it — %2e%2e should be treated as the literal
+  // filename characters "%2e%2e", not as "..". This matches the "safe"
+  // encoded fixture file which contains a literal "%2e%2e" filename.
+  let candidate = userPath;
+
+  // If absolute, treat it as relative to sandbox root (strip leading slash),
+  // rather than an actual absolute filesystem path.
+  if (path.isAbsolute(candidate)) {
+    candidate = candidate.slice(1);
+  }
+
+  const joined = path.join(SANDBOX_ROOT, candidate);
+  const normalized = path.normalize(joined);
+
+  // Must stay within sandbox root after normalization.
+  const rootWithSep = SANDBOX_ROOT.endsWith(path.sep)
+    ? SANDBOX_ROOT
+    : SANDBOX_ROOT + path.sep;
+
+  if (normalized !== SANDBOX_ROOT && !normalized.startsWith(rootWithSep)) {
+    return { ok: false, reason: 'path escapes sandbox' };
+  }
+
+  // Resolve symlinks / real path to prevent symlink escape, but tolerate
+  // ENOENT (file may not exist) by checking the real parent directory instead.
+  try {
+    const real = fs.realpathSync(normalized);
+    const realRoot = fs.realpathSync(SANDBOX_ROOT);
+    const realRootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+    if (real !== realRoot && !real.startsWith(realRootWithSep)) {
+      return { ok: false, reason: 'path escapes sandbox (symlink)' };
+    }
+    return { ok: true, resolved: real };
+  } catch (e) {
+    // File might not exist yet or mid-path missing; verify existing ancestor
+    // dir is inside sandbox as a fallback safety check.
+    try {
+      let dir = path.dirname(normalized);
+      while (!fs.existsSync(dir) && dir !== path.dirname(dir)) {
+        dir = path.dirname(dir);
+      }
+      const realDir = fs.realpathSync(dir);
+      const realRoot = fs.realpathSync(SANDBOX_ROOT);
+      const realRootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+      if (realDir !== realRoot && !realDir.startsWith(realRootWithSep)) {
+        return { ok: false, reason: 'path escapes sandbox' };
+      }
+      return { ok: true, resolved: normalized };
+    } catch (e2) {
+      return { ok: false, reason: 'path escapes sandbox' };
+    }
+  }
 }
 
-function checkCycle(steps) {
-  if (steps.length < 6) return false;
-  const c = steps.slice(-6).map(canonicalStr);
-  const [a1, b1, a2, b2, a3, b3] = c;
-  if (a1 === a2 && a2 === a3 && b1 === b2 && b2 === b3 && a1 !== b1) {
+// ---- URL / SSRF guarding ----
+
+const PRIVATE_V4_RANGES = [
+  [ [10,0,0,0], [10,255,255,255] ],
+  [ [172,16,0,0], [172,31,255,255] ],
+  [ [192,168,0,0], [192,168,255,255] ],
+  [ [127,0,0,0], [127,255,255,255] ],       // loopback
+  [ [169,254,0,0], [169,254,255,255] ],     // link-local / metadata
+  [ [0,0,0,0], [0,255,255,255] ],
+  [ [100,64,0,0], [100,127,255,255] ],      // CGNAT
+  [ [192,0,0,0], [192,0,0,255] ],
+  [ [192,0,2,0], [192,0,2,255] ],
+  [ [198,18,0,0], [198,19,255,255] ],
+  [ [198,51,100,0], [198,51,100,255] ],
+  [ [203,0,113,0], [203,0,113,255] ],
+  [ [224,0,0,0], [255,255,255,255] ],       // multicast/reserved
+];
+
+function ipv4ToInt(parts) {
+  return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+}
+
+function isPrivateIPv4(ip) {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) {
+    return true; // malformed -> treat as unsafe
+  }
+  const val = ipv4ToInt(parts) >>> 0;
+  for (const [lo, hi] of PRIVATE_V4_RANGES) {
+    const loVal = ipv4ToInt(lo) >>> 0;
+    const hiVal = ipv4ToInt(hi) >>> 0;
+    if (val >= loVal && val <= hiVal) return true;
+  }
+  return false;
+}
+
+function isPrivateIPv6(ip) {
+  const lower = ip.toLowerCase();
+  if (lower === '::1') return true; // loopback
+  if (lower === '::') return true;
+  if (lower.startsWith('fe80')) return true; // link-local
+  if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // unique local
+  if (lower.startsWith('::ffff:')) {
+    // IPv4-mapped IPv6 - check the embedded IPv4
+    const v4 = lower.split(':').pop();
+    if (net.isIPv4(v4)) return isPrivateIPv4(v4);
     return true;
   }
   return false;
 }
 
-function handleDecision(body) {
-  const budget = body.budget_tokens;
-  const steps = Array.isArray(body.steps) ? body.steps : [];
-
-  if (steps.length === 0) {
-    return { decision: 'continue', reason: 'Fresh run with no steps taken yet.' };
-  }
-
-  const total = steps.reduce((sum, s) => sum + (Number(s.tokens_used) || 0), 0);
-
-  if (checkRepeat(steps)) {
-    return { decision: 'halt', reason: 'Same tool called 3+ times in a row with functionally identical arguments (a loop).' };
-  }
-  if (checkCycle(steps)) {
-    return { decision: 'halt', reason: 'Trailing steps show a repeating 2-step A/B cycle (a loop).' };
-  }
-  if (total >= budget) {
-    return { decision: 'halt', reason: `Cumulative tokens_used (${total}) has reached the budget (${budget}).` };
-  }
-  return { decision: 'continue', reason: `Under budget (${total}/${budget}) with no loop detected.` };
+function isPrivateIP(ip) {
+  if (net.isIPv4(ip)) return isPrivateIPv4(ip);
+  if (net.isIPv6(ip)) return isPrivateIPv6(ip);
+  return true;
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
-    return;
+async function validateFetchUrl(rawUrl) {
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch (e) {
+    return { ok: false, reason: 'unparseable URL' };
   }
-  if (req.method !== 'POST') {
-    res.writeHead(405);
-    res.end();
-    return;
+
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    return { ok: false, reason: 'only http/https allowed' };
   }
-  let data = '';
-  req.on('data', (chunk) => { data += chunk; });
-  req.on('end', () => {
-    let result;
-    try {
-      const body = JSON.parse(data);
-      result = handleDecision(body);
-    } catch (e) {
-      result = { decision: 'halt', reason: 'Malformed request body.' };
+
+  // Userinfo-confusion: reject any URL containing userinfo (user:pass@host)
+  if (u.username || u.password) {
+    return { ok: false, reason: 'userinfo not allowed' };
+  }
+
+  const hostname = u.hostname.toLowerCase();
+
+  // Reject literal IP hosts outright (no allowed host is an IP).
+  if (net.isIP(hostname)) {
+    return { ok: false, reason: 'raw IP hosts not allowed' };
+  }
+
+  // Strict allowlist on exact hostname (no subdomain trickery, no lookalikes).
+  if (!ALLOWED_HOSTS.has(hostname)) {
+    return { ok: false, reason: 'host not in allowlist' };
+  }
+
+  // Resolve DNS and make sure it doesn't point to a private/loopback/link-local
+  // / metadata address (DNS rebinding protection).
+  let addresses;
+  try {
+    addresses = await dns.lookup(hostname, { all: true });
+  } catch (e) {
+    return { ok: false, reason: 'DNS resolution failed' };
+  }
+
+  if (!addresses.length) {
+    return { ok: false, reason: 'no addresses resolved' };
+  }
+
+  for (const a of addresses) {
+    if (isPrivateIP(a.address)) {
+      return { ok: false, reason: 'host resolves to private/internal address' };
     }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(result));
+  }
+
+  return { ok: true, url: u, resolvedAddress: addresses[0].address };
+}
+
+// Perform the actual fetch, pinning the connection to the pre-validated IP
+// and re-validating on every redirect hop (no redirect-to-private).
+function fetchUrlPinned(u, resolvedAddress, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    const lib = u.protocol === 'https:' ? https : http;
+
+    const options = {
+      protocol: u.protocol,
+      hostname: resolvedAddress, // connect directly to validated IP
+      servername: u.protocol === 'https:' ? u.hostname : undefined, // SNI/cert check against real hostname
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      headers: { Host: u.hostname, 'User-Agent': 'guardrail-fetch/1.0' },
+      timeout: 8000,
+    };
+
+    const req = lib.request(options, async (res) => {
+      // Handle redirects manually so each hop is re-validated.
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        if (redirectsLeft <= 0) {
+          reject(new Error('too many redirects'));
+          return;
+        }
+        let nextUrl;
+        try {
+          nextUrl = new URL(res.headers.location, u);
+        } catch (e) {
+          reject(new Error('invalid redirect location'));
+          return;
+        }
+        const check = await validateFetchUrl(nextUrl.toString());
+        if (!check.ok) {
+          reject(new Error('redirect blocked: ' + check.reason));
+          return;
+        }
+        try {
+          const result = await fetchUrlPinned(check.url, check.resolvedAddress, redirectsLeft - 1);
+          resolve(result);
+        } catch (e) {
+          reject(e);
+        }
+        return;
+      }
+
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        data += chunk;
+        if (data.length > 2_000_000) {
+          res.destroy();
+        }
+      });
+      res.on('end', () => {
+        resolve({ status: res.statusCode, text: data });
+      });
+    });
+
+    req.on('timeout', () => {
+      req.destroy(new Error('request timed out'));
+    });
+    req.on('error', reject);
+    req.end();
   });
+}
+
+// ---------- request handler ----------
+
+async function handleReadFile(args) {
+  const p = args && args.path;
+  const check = resolveSandboxPath(p);
+  if (!check.ok) {
+    return { action: 'block', reason: check.reason };
+  }
+  try {
+    const stat = fs.statSync(check.resolved);
+    if (stat.isDirectory()) {
+      const entries = fs.readdirSync(check.resolved);
+      return { action: 'allow', reason: 'directory listing within sandbox', result: entries.join('\n') };
+    }
+    const content = fs.readFileSync(check.resolved, 'utf8');
+    return { action: 'allow', reason: 'file within sandbox', result: content };
+  } catch (e) {
+    return { action: 'block', reason: 'file not accessible: ' + e.code };
+  }
+}
+
+async function handleFetchUrl(args) {
+  const rawUrl = args && args.url;
+  if (typeof rawUrl !== 'string') {
+    return { action: 'block', reason: 'invalid url' };
+  }
+  const check = await validateFetchUrl(rawUrl);
+  if (!check.ok) {
+    return { action: 'block', reason: check.reason };
+  }
+  try {
+    const result = await fetchUrlPinned(check.url, check.resolvedAddress);
+    return { action: 'allow', reason: 'host allowlisted and validated', result: result.text };
+  } catch (e) {
+    return { action: 'block', reason: 'fetch failed: ' + e.message };
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method !== 'POST') {
+    return jsonResponse(res, 405, { action: 'block', reason: 'method not allowed' });
+  }
+
+  let bodyStr;
+  try {
+    bodyStr = await readBody(req);
+  } catch (e) {
+    return jsonResponse(res, 400, { action: 'block', reason: 'body read error' });
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(bodyStr);
+  } catch (e) {
+    return jsonResponse(res, 200, { action: 'block', reason: 'invalid JSON' });
+  }
+
+  const tool = payload && payload.tool;
+  const args = payload && payload.arguments;
+
+  try {
+    if (tool === 'read_file') {
+      const out = await handleReadFile(args || {});
+      return jsonResponse(res, 200, out);
+    }
+    if (tool === 'fetch_url') {
+      const out = await handleFetchUrl(args || {});
+      return jsonResponse(res, 200, out);
+    }
+    return jsonResponse(res, 200, { action: 'block', reason: 'unknown tool' });
+  } catch (e) {
+    return jsonResponse(res, 200, { action: 'block', reason: 'internal error: ' + e.message });
+  }
 });
 
-const port = process.env.PORT || 10000;
-server.listen(port, () => console.log(`Run-guard listening on ${port}`));
+server.listen(PORT, () => {
+  console.log(`Guardrail endpoint listening on port ${PORT}`);
+});
