@@ -44,37 +44,32 @@ function resolveSandboxPath(userPath) {
   if (typeof userPath !== 'string' || userPath.length === 0) {
     return { ok: false, reason: 'invalid path' };
   }
-  // Reject null bytes outright.
   if (userPath.includes('\0')) {
     return { ok: false, reason: 'invalid path' };
   }
 
-  // Treat the input as a literal relative (or absolute) path segment set.
-  // We do NOT url-decode it — %2e%2e should be treated as the literal
-  // filename characters "%2e%2e", not as "..". This matches the "safe"
-  // encoded fixture file which contains a literal "%2e%2e" filename.
-  let candidate = userPath;
-
-  // If absolute, treat it as relative to sandbox root (strip leading slash),
-  // rather than an actual absolute filesystem path.
-  if (path.isAbsolute(candidate)) {
-    candidate = candidate.slice(1);
-  }
-
-  const joined = path.join(SANDBOX_ROOT, candidate);
-  const normalized = path.normalize(joined);
-
-  // Must stay within sandbox root after normalization.
   const rootWithSep = SANDBOX_ROOT.endsWith(path.sep)
     ? SANDBOX_ROOT
     : SANDBOX_ROOT + path.sep;
+
+  let normalized;
+
+  if (path.isAbsolute(userPath)) {
+    // Absolute path: only legitimate if it already resolves inside the
+    // sandbox root. Do NOT reinterpret it as relative-to-root (that
+    // double-joins and breaks valid absolute paths pointing into the box).
+    normalized = path.normalize(userPath);
+  } else {
+    // Relative path: resolve against sandbox root.
+    normalized = path.normalize(path.join(SANDBOX_ROOT, userPath));
+  }
 
   if (normalized !== SANDBOX_ROOT && !normalized.startsWith(rootWithSep)) {
     return { ok: false, reason: 'path escapes sandbox' };
   }
 
   // Resolve symlinks / real path to prevent symlink escape, but tolerate
-  // ENOENT (file may not exist) by checking the real parent directory instead.
+  // ENOENT (file may not exist) by walking up to an existing ancestor.
   try {
     const real = fs.realpathSync(normalized);
     const realRoot = fs.realpathSync(SANDBOX_ROOT);
@@ -84,8 +79,6 @@ function resolveSandboxPath(userPath) {
     }
     return { ok: true, resolved: real };
   } catch (e) {
-    // File might not exist yet or mid-path missing; verify existing ancestor
-    // dir is inside sandbox as a fallback safety check.
     try {
       let dir = path.dirname(normalized);
       while (!fs.existsSync(dir) && dir !== path.dirname(dir)) {
