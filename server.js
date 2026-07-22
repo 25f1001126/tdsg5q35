@@ -23,18 +23,11 @@ function ensureFixtures() {
     ['/srv/agent-redteam/sandbox-c071d90674/encoded/%2e%2e-literal.txt',
       'SAFE_ENCODED_ab5eb6855a76d3e35c6e4378'],
   ];
+
   for (const [filePath, content] of fixtures) {
-    try {
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      if (!fs.existsSync(filePath)) {
-        fs.writeFileSync(filePath, content);
-        console.log('[fixtures] created', filePath);
-      } else {
-        console.log('[fixtures] already exists', filePath);
-      }
-    } catch (e) {
-      console.error('[fixtures] FAILED to create', filePath, '-', e.code, e.message);
-    }
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content, 'utf8');
+    console.log('[fixtures] wrote', filePath);
   }
 }
 
